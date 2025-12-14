@@ -21,10 +21,8 @@ from serpapi import GoogleSearch
 待改进的点：
 2、多文件上传和追加存储
 3、噪声处理机制
-5、矛盾检测机制
 6、自定义分块逻辑
 7、本地模型回答混乱并且加载缓慢
-8、模型回答溯源
 。。。。
 
 '''
@@ -67,6 +65,7 @@ def load_directory(directory):
         if os.path.isfile(file_path):
             new_docs = load_single_file(file_path)
             docs = docs + new_docs
+            # print("查看详情：",new_docs)
             print(f"加载{file_path}成功")
             print(f"新增长度：{len(new_docs)}, 当前长度：{len(docs)}")
     return docs
@@ -78,8 +77,9 @@ def split_text(documents:Iterable[Document], chunk_size=200, chunk_overlap=30):
         输入：list[Document]，切分参数
         输出：list[Document]
     '''
-    splliter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,chunk_overlap=chunk_overlap) # 循环递归切分器（段落-句子-字符），最大字符数为500，切分重叠度为50
-    chunks = splliter.split_documents(documents) 
+    splliter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,chunk_overlap=chunk_overlap, add_start_index=True) # 循环递归切分器（段落-句子-字符），最大字符数为500，切分重叠度为50
+    chunks = splliter.split_documents(documents)
+    print("第一个分块：",chunks[0])
     print(f"分块数：{len(chunks)}")
     return chunks
 
@@ -143,11 +143,12 @@ def build_retriever(db, search_type="similarity", search_kwargs={"k": 3}):
 def retrieve_relevant_chunks(query, retriever, top_relevant_k):
     '''
         输入：query，retriever，top_relevant_k
-        输出：str
+        输出：list[Document]，str，str
     '''
     docs = retriever._get_relevant_documents(query,run_manager=None) # list[Document]
     local_context = " \n".join([f"{i}:{d.page_content}" for i,d in zip(range(1,top_relevant_k+1),docs)])
-    return local_context
+    local_metadata = " \n".join([f"{i}:{d.metadata}" for i,d in zip(range(1,top_relevant_k+1),docs)])
+    return docs, local_context, local_metadata
 
 
 
@@ -190,14 +191,34 @@ def need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY):
     else:
         return "模型判断是否需要联网失败"
 
-# 构建模型判断是否需要联网的提示词
-def build_net_search_prompt(query,local_context):
-    '''
-        输入：query
-        输出：str
-    '''
-    prompt = f"你只需要回答True或False。\n已知知识库：\n{local_context}\n\n对于问题: {query}，如果知识库中没有找到答案，回答:True; 如果知识库中找到答案，回答:False"
+def build_net_search_prompt(query, local_context):
+    prompt = f"""
+        你是一个知识充分性判断专家。
+
+        你只需要回答 True 或 False，不要输出任何其他内容。
+
+        已知：以下是从本地知识库中检索到的内容（可能相关，也可能不完整）：
+        --------------------
+        {local_context}
+        --------------------
+
+        判断标准（请严格遵守）：
+
+        - 如果【本地知识库中的信息】能够**直接、明确、完整地回答问题**，
+        且不需要额外背景、补充事实或推测，请回答：False；
+
+        - 如果出现以下任一情况，请回答：True：
+        1. 知识库中没有提到问题的关键事实；
+        2. 只提到了部分信息，无法形成完整答案；
+        3. 信息存在不确定性、模糊表述或“可能”“尚未”“未披露”等情况；
+        4. 即使相关，但不足以支撑一个确定性回答；
+        5. 根据现有信息，你在回答问题时只能说“无法确定”“不知道”。
+
+        问题：
+        {query}
+        """
     return prompt
+
 
 
 # 网络信息矛盾检测与可信源筛选, 本地知识库优先级最高默认完全正确，主要对网络结果做矛盾检测。
@@ -241,38 +262,42 @@ def detect_conflict_and_filter_net_results(query, SERPAPI_KEY, local_model_name,
 
             输出格式（必须是合法 JSON，不要输出任何额外文本）：
             {{
-            "has_contradiction": "true",
-            "conflicting_pairs": [
-                {{
-                "snippet_a": "文本 A",
-                "snippet_b": "文本 B",
-                "conflict_reason": "冲突原因"
-                }}
-            ],
-            "trusted_evidences": [
-                {{
-                "title": "标题",
-                "url": "链接",
-                "snippet": "摘要",
-                "date": "日期或空字符串",
-                "trust_reason": "可信原因"
-                }}
-            ],
-            "summary": "整体判断说明"
+                "has_contradiction": "true",
+                "conflicting_pairs": [
+                    {{
+                        "snippet_a": "文本 A",
+                        "snippet_b": "文本 B",
+                        "conflict_reason": "冲突原因"
+                    }}
+                ],
+                "trusted_evidences": [
+                    {{
+                        "title": "标题",
+                        "url": "链接",
+                        "snippet": "摘要",
+                        "date": "日期或空字符串",
+                        "trust_reason": "可信原因"
+                    }}
+                ],
+                "summary": "整体判断说明"
             }}
-            
+
             注意：
             - has_contradiction 只能是字符串："true"、"false" 或 "uncertain"
             - 如果没有冲突，conflicting_pairs 必须是 []
             - 如果没有可信证据，trusted_evidences 必须是 []
             - 所有字段都必须存在
+            - 输出的内容必须严格遵循上述 JSON 格式，不要包含任何额外的文本或字符
+            - 生成的 JSON 请使用双引号，并确保所有字符串值都用双引号括起来
+            - 确保生成的 JSON 内容中没有多余的逗号或其他语法错误
         """
     response = model_answer(prompt, local_model_name, SILICONFLOW_API_KEY, max_new_tokens=5000, temperature=0.3, top_p=0.7, top_k=50, local_model=False)
     print(f"矛盾检测模型回复：\ntype:{type(response)}\n, {response}")
     
     try:
         response_dict = json.loads(response)
-        print(f"矛盾检测模型回复json化：\n{response_dict}")
+        print("---------------------网络输出解析成功----------------------")
+        # print(f"矛盾检测模型回复json化：\n{response_dict}")
         has_contradiction = response_dict['has_contradiction']
         conflicting_pairs = response_dict['conflicting_pairs']
         trusted_evidences = response_dict['trusted_evidences']
@@ -298,25 +323,121 @@ def detect_conflict_and_filter_net_results(query, SERPAPI_KEY, local_model_name,
 
 
 # 构造模型回答提示词
-def contruct_answer_prompt(query, local_context,local_model_name, SILICONFLOW_API_KEY):
+def contruct_answer_prompt(query, local_context, local_metadata, local_model_name, SILICONFLOW_API_KEY):
     '''
-        输入：query，local_context,local_model_name, SILICONFLOW_API_KEY
+        输入：query，local_context, local_metadata, local_model_name, SILICONFLOW_API_KEY
         输出：str
     '''
     need_net_search_flag  = need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY)
 
     if need_net_search_flag :
-        _, net_context = network_search(query,SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10)
+        # _, net_context = network_search(query,SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10)
         _, _, extracted_trusted_results = detect_conflict_and_filter_net_results(query,SERPAPI_KEY,local_model_name,SILICONFLOW_API_KEY)
-        net_context = "\n".join([
+        valid_net_context = "\n".join([
             f"{i+1}. 标题: {info['title']}\n   URL: {info['url']}\n   摘要: {info['snippet']}\n   日期: {info['date']}\n"
             for i, info in enumerate(extracted_trusted_results)
         ])
-        prompt = f"请根据以下网络搜索结果及知识库内容回答问题，并指明来源:\n网络搜索结果：\n{net_context}\n\n知识库内容：\n{local_context}\n\n问题: {query} "
+        prompt = f"""
+            你是一个基于证据回答问题的专家。
+
+            请根据以下提供的【网络搜索结果】和【本地知识库内容】回答用户问题，
+            并使用类似论文“参考文献”的方式标明信息来源。
+
+            ====================
+            用户问题：
+            {query}
+
+            ====================
+            网络搜索结果（net_context）：
+            每条包含 标题、URL、摘要、日期（如有）
+            {valid_net_context}
+
+            ====================
+            本地知识库内容（local_context）：
+            以下为多个知识库分块（chunk）的原始内容
+            {local_context}
+
+            ====================
+            本地知识库分块对应的元信息（local_metadata）：
+            每个分块包含可用于定位来源的元信息（例如文件名、页码等）
+            {local_metadata}
+
+            ====================
+            回答与引用规则（非常重要）：
+
+            1. 回答必须严格基于以上提供的信息，不允许使用任何外部知识；
+            2. 回答正文中，每一条关键事实后必须使用【数字】形式标注来源，例如【1】【2】；
+            3. 引用编号从 1 开始，按首次出现顺序递增；
+            4. 【网络信息】的引用：
+            - 在【来源说明】中直接给出对应的 URL；
+            5. 【本地知识库】的引用：
+            - 在【来源说明】中原样给出该分块的元信息（来自 local_metadata）；
+            - 不允许生成 doc_id、index 或任何未提供的标识；
+            6. 回答正文中出现的每一个引用编号，必须在【来源说明】中出现；
+            7. 【来源说明】中不得出现正文未使用的引用编号；
+            8. 如果某个事实无法找到明确来源，请不要输出该事实。
+
+            ====================
+            输出格式（必须严格遵守，不要输出任何多余内容）：
+
+            【回答】
+            （自然语言回答，关键事实后使用【1】【2】等引用标注）
+
+            【来源说明】
+            [1] 网络来源或本地知识库元信息
+            [2] 网络来源或本地知识库元信息
+
+        
+        """
+        # prompt = f"请根据以下网络搜索结果及知识库内容回答问题，并根据网络搜索结果链接和知识库元数据指明来源:\n网络搜索结果：\n{valid_net_context}\n\n知识库内容：\n{local_context}\n知识库对应的元数据：\n{local_metadata}\n\n问题: {query} "
         print(f"需要联网搜索，提示词：\n{prompt}")
         return prompt
     else:
-        prompt = f"请根据以下知识库内容回答问题，并指明来源:\n知识库内容：\n{local_context}\n\n问题: {query} "
+        prompt = f"""
+            你是一个基于证据回答问题的专家。
+
+            请根据以下提供的【本地知识库内容】回答用户问题，
+            并使用类似论文“参考文献”的方式标明信息来源。
+
+            ====================
+            用户问题：
+            {query}
+
+            ====================
+            本地知识库内容（local_context）：
+            以下为多个知识库分块（chunk）的原始内容
+            {local_context}
+
+            ====================
+            本地知识库分块对应的元信息（local_metadata）：
+            每个分块包含可用于定位来源的元信息（例如文件名、页码等）
+            {local_metadata}
+
+            ====================
+            回答与引用规则（非常重要）：
+
+            1. 回答必须严格基于以上提供的信息，不允许使用任何外部知识；
+            2. 回答正文中，每一条关键事实后必须使用【数字】形式标注来源，例如【1】【2】；
+            3. 引用编号从 1 开始，按首次出现顺序递增；
+            4. 【本地知识库】的引用：
+            - 在【来源说明】中原样给出该分块的元信息（来自 local_metadata）；
+            - 不允许生成 doc_id、index 或任何未提供的标识；
+            5. 回答正文中出现的每一个引用编号，必须在【来源说明】中出现；
+            6. 【来源说明】中不得出现正文未使用的引用编号；
+            7. 如果某个事实无法找到明确来源，请不要输出该事实。
+
+            ====================
+            输出格式（必须严格遵守，不要输出任何多余内容）：
+
+            【回答】
+            （自然语言回答，关键事实后使用【1】【2】等引用标注）
+
+            【来源说明】
+            [1]本地知识库元信息
+            [2]本地知识库元信息
+        """
+
+        # prompt = f"请根据以下知识库内容回答问题，并根据知识库元数据指明来源:\n知识库内容：\n{local_context}\n\n问题: {query} "
         print(f"不需要联网搜索，提示词：\n{prompt}")
         return prompt
 
@@ -377,7 +498,7 @@ if __name__ == '__main__':
     data_directory = os.path.join(os.path.dirname(__file__), "data")
     embedding_model_name = "Qwen/Qwen3-Embedding-0.6B"
     collection_name = "test"
-    persist_directory = os.path.join(os.path.dirname(__file__), "chroma")
+    persist_directory = os.path.join(os.path.dirname(__file__), "chroma3")
     top_relevant_k=3
     local_model_name = "google/gemma-2-2b-it"
     query = "美股能赚到钱吗"
@@ -391,8 +512,8 @@ if __name__ == '__main__':
         db = load_chroma(embedding_model_name, persist_directory, collection_name)
 
     retriever = build_retriever(db, search_type="similarity", search_kwargs={"k": top_relevant_k})
-    local_context = retrieve_relevant_chunks(query=query, retriever=retriever, top_relevant_k=top_relevant_k)
+    docs, local_context, local_metadata = retrieve_relevant_chunks(query=query, retriever=retriever, top_relevant_k=top_relevant_k)
 
-    prompt = contruct_answer_prompt(query=query, local_context=local_context,local_model_name=local_model_name, SILICONFLOW_API_KEY=SILICONFLOW_API_KEY)
+    prompt = contruct_answer_prompt(query=query, local_context=local_context,local_metadata=local_metadata,local_model_name=local_model_name, SILICONFLOW_API_KEY=SILICONFLOW_API_KEY)
     answer = model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
     print(f'\n问题：{query}\n回答：{answer}')
