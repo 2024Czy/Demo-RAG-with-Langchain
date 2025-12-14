@@ -11,10 +11,14 @@ import json
 import docx
 from langchain_core.documents import BaseDocumentTransformer, Document
 from typing import Iterable
+from serpapi import GoogleSearch
+
+
+
+
 
 '''
 待改进的点：
-1. 文档加载器的选择，目前只支持docx格式，可以扩展到其他格式
 2、多文件上传和追加存储
 3、噪声处理机制
 4、网络搜索机制
@@ -113,7 +117,8 @@ def load_chroma(embedding_model_name, persist_directory, collection_name):
         输出：Chroma
     '''
     if not os.path.exists(os.path.join(persist_directory, "chroma.sqlite3")):
-        raise FileNotFoundError("chroma.sqlite3不存在")
+        print("chroma.sqlite3不存在")
+        return None
         
     else:
         print("chroma.sqlite3已存在，加载...")
@@ -135,9 +140,85 @@ def build_retriever(db, search_type="similarity", search_kwargs={"k": 3}):
     retriever = db.as_retriever(search_type=search_type, search_kwargs=search_kwargs)
     return retriever
 
+# 检索相关分块内容
+def retrieve_relevant_chunks(query, retriever, top_relevant_k):
+    '''
+        输入：query，retriever，top_relevant_k
+        输出：str
+    '''
+    docs = retriever._get_relevant_documents(query,run_manager=None) # list[Document]
+    local_context = " \n".join([f"{i}:{d.page_content}" for i,d in zip(range(1,top_relevant_k+1),docs)])
+    return local_context
+
+# 网络搜索
+def network_search(query, SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10):
+    '''
+        输入：query，top_k
+        输出：
+    '''
+    params = {
+    "engine": engine,
+    "q": query,
+    "google_domain": googl_domain,
+    "hl": "zh-cn",
+    "gl": "cn",
+    "num":num,
+    "api_key": SERPAPI_KEY
+    }
+
+    search = GoogleSearch(params)
+    results = search.get_dict()
+    organic_results = results["organic_results"]
+    net_results = [ {"title": info["title"], "url": info["link"], "snippet": info["snippet"],'date':info['date'] if 'date' in info else None} for info in organic_results]
+    net_context = "\n".join([f"{i}:{info['title']}\n{info['snippet']}\n{info['url']}\n{info['date']}\n" for i, info in enumerate(net_results,1)])
+    return net_context
+
+# 判断是否需要联网搜索
+def need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY):
+    '''
+        输入：query, local_context, local_model_name, Siliconflow_API_KEY
+        输出：bool    
+    '''
+    prompt =build_net_search_prompt(query,local_context)
+    response = model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
+    print(f"模型判断是否需要联网：{response}")
+    if  "TRUE" in str(response).upper():
+        return True
+    elif  "FALSE"  in str(response).upper():
+        return False
+    else:
+        return "模型判断是否需要联网失败"
+
+# 构建模型判断是否需要联网的提示词
+def build_net_search_prompt(query,local_context):
+    '''
+        输入：query
+        输出：str
+    '''
+    prompt = f"你只需要回答True或False。\n已知知识库：\n{local_context}\n\n对于问题: {query}，如果知识库中没有找到答案，回答:True; 如果知识库中找到答案，回答:False"
+    return prompt
+
+# 构造模型回答提示词
+def contruct_answer_prompt(query, local_context,local_model_name, SILICONFLOW_API_KEY):
+    '''
+        输入：query，local_context,local_model_name, SILICONFLOW_API_KEY
+        输出：str
+    '''
+    need_net_search_flag  = need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY)
+
+    if need_net_search_flag :
+        net_context = network_search(query,SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10)
+        prompt = f"请根据以下网络搜索结果及知识库内容回答问题，并指明来源:\n网络搜索结果：\n{net_context}\n\n知识库内容：\n{local_context}\n\n问题: {query} "
+        print(f"需要联网搜索，提示词：\n{prompt}")
+        return prompt
+    else:
+        prompt = f"请根据以下知识库内容回答问题，并指明来源:\n知识库内容：\n{local_context}\n\n问题: {query} "
+        print(f"不需要联网搜索，提示词：\n{prompt}")
+        return prompt
 
 
-# 选择回答的语言模型
+# 模型回答
+
 def model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False):
     '''
         输入：prompt，local_model
@@ -166,7 +247,7 @@ def model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350
                 }
             ],
             "max_tokens": max_new_tokens,
-            "system": "你是一个股票经纪人",
+            "system": "",
             "stop_sequences": [],
             "stream": False,
             "temperature": temperature,
@@ -178,42 +259,36 @@ def model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350
             "Content-Type": "application/json"
         }
 
-        response = requests.post(url, json=payload, headers=headers)
+        response = requests.post(url, json=payload, headers=headers, timeout=60)
         response_dict = json.loads(response.text)
         return response_dict['content'][0]['text']
 
 
 
-# 问答
-def rag_answer(query):
-    print("query:", query)
-    print(inspect.getsource(retriever._get_relevant_documents))
-    docs = retriever._get_relevant_documents(query,run_manager=None)
-    context = " \n".join([f"{i}:{d.page_content}" for i,d in zip(range(1,top_relevant_k+1),docs)])
-    print("context：\n", context)
+
+
+if __name__ == '__main__':
+    SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
+    SERPAPI_KEY = os.environ.get("SERPAPI_KEY")
+    data_directory = os.path.join(os.path.dirname(__file__), "data")
+    embedding_model_name = "Qwen/Qwen3-Embedding-0.6B"
+    collection_name = "test"
+    persist_directory = os.path.join(os.path.dirname(__file__), "chroma")
+    top_relevant_k=3
+    local_model_name = "google/gemma-2-2b-it"
+    query = "中国证监会主席是谁？"
+
     
-    prompt = f"请根据以下知识库内容回答问题，并指明来源:\n知识库内容：\n{context}\n\n问题: {query} "
-    
-    print("输入：\n", prompt)
-    print("\n输出：\n")
-    return model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
-
- 
-data_directory = os.path.join(os.path.dirname(__file__), "data")
-embedding_model_name = "Qwen/Qwen3-Embedding-0.6B"
-collection_name = "test"
-persist_directory = os.path.join(os.path.dirname(__file__), "chroma")
-top_relevant_k=3
-SILICONFLOW_API_KEY = os.environ.get("SILICONFLOW_API_KEY")
-local_model_name = "google/gemma-2-2b-it"
-
-
-docs = load_directory(data_directory)
-chunks = split_text(docs, chunk_size=200, chunk_overlap=30)
-db = store_chroma(chunks, embedding_model_name,collection_name, persist_directory)
-if db is None:
     db = load_chroma(embedding_model_name, persist_directory, collection_name)
-retriever = build_retriever(db, search_type="similarity", search_kwargs={"k": top_relevant_k})
+    if db is None:
+        docs = load_directory(data_directory)
+        chunks = split_text(docs, chunk_size=200, chunk_overlap=30)
+        db = store_chroma(chunks, embedding_model_name,collection_name, persist_directory)
+        db = load_chroma(embedding_model_name, persist_directory, collection_name)
 
-# 测试
-print(rag_answer("国家监督管理总局有什么新闻？"))
+    retriever = build_retriever(db, search_type="similarity", search_kwargs={"k": top_relevant_k})
+    local_context = retrieve_relevant_chunks(query=query, retriever=retriever, top_relevant_k=top_relevant_k)
+
+    prompt = contruct_answer_prompt(query=query, local_context=local_context,local_model_name=local_model_name, SILICONFLOW_API_KEY=SILICONFLOW_API_KEY)
+    answer = model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
+    print(f'\n问题：{query}\n回答：{answer}')
