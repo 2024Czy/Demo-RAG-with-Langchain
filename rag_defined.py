@@ -21,7 +21,6 @@ from serpapi import GoogleSearch
 待改进的点：
 2、多文件上传和追加存储
 3、噪声处理机制
-4、网络搜索机制
 5、矛盾检测机制
 6、自定义分块逻辑
 7、本地模型回答混乱并且加载缓慢
@@ -150,6 +149,8 @@ def retrieve_relevant_chunks(query, retriever, top_relevant_k):
     local_context = " \n".join([f"{i}:{d.page_content}" for i,d in zip(range(1,top_relevant_k+1),docs)])
     return local_context
 
+
+
 # 网络搜索
 def network_search(query, SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10):
     '''
@@ -171,7 +172,7 @@ def network_search(query, SERPAPI_KEY, engine="google_light",googl_domain="googl
     organic_results = results["organic_results"]
     net_results = [ {"title": info["title"], "url": info["link"], "snippet": info["snippet"],'date':info['date'] if 'date' in info else None} for info in organic_results]
     net_context = "\n".join([f"{i}:{info['title']}\n{info['snippet']}\n{info['url']}\n{info['date']}\n" for i, info in enumerate(net_results,1)])
-    return net_context
+    return net_results, net_context
 
 # 判断是否需要联网搜索
 def need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY):
@@ -198,6 +199,104 @@ def build_net_search_prompt(query,local_context):
     prompt = f"你只需要回答True或False。\n已知知识库：\n{local_context}\n\n对于问题: {query}，如果知识库中没有找到答案，回答:True; 如果知识库中找到答案，回答:False"
     return prompt
 
+
+# 网络信息矛盾检测与可信源筛选, 本地知识库优先级最高默认完全正确，主要对网络结果做矛盾检测。
+def detect_conflict_and_filter_net_results(query, SERPAPI_KEY, local_model_name, SILICONFLOW_API_KEY):
+    '''
+        输入：query，retriever，top_relevant_k,SERPAPI_KEY
+        输出：检测结论,矛盾信息，可信信息
+    '''
+    net_results, _ = network_search(query, SERPAPI_KEY, engine="google_light", googl_domain="google.com", num=10)
+    prompt = f"""
+            你是一个网络信息一致性与证据筛选专家。
+            给定以下网络搜索结果（net_results），它们描述的是同一主题或相关事实：
+
+            net_results：
+            {net_results}
+
+            任务：
+            1. 判断这些网络结果之间是否存在语义矛盾；
+            2. 在此基础上，从网络结果中筛选出3条相对可信、可作为证据使用的信息；如果可信信息条数小于3条，可以返回低于3条的信息。
+                如果没有可信信息，可以返回空数组。
+
+            判定规则：
+
+            【矛盾判定】
+            - 如果不同结果对同一关键事实给出了互相冲突的描述（如时间、数值、身份、结论相反），视为存在矛盾；
+            - 信息不完整、表述角度不同、时间精度不同，不视为矛盾；
+            - 若无法判断，返回“不确定”。
+
+            【可信度评估（仅基于给定信息）】
+            优先选择具备以下特征的结果：
+            - 网络域名是政府、企业、媒体、新闻网站等权威机构；
+            - 描述具体、信息完整；
+            - 与多数其他结果一致；
+            - 时间标注明确且相对较新（如果提供了 date）；
+            - 表述客观，不含明显猜测或模糊措辞。
+
+            请严格按照以下步骤进行（不要在输出中展示思考过程）：
+            1. 提取每条网络结果的核心事实；
+            2. 比较这些事实，识别是否存在矛盾；
+            3. 在无明显矛盾或冲突较小的结果中，筛选可信证据。
+
+            输出格式（必须是合法 JSON，不要输出任何额外文本）：
+            {{
+            "has_contradiction": "true",
+            "conflicting_pairs": [
+                {{
+                "snippet_a": "文本 A",
+                "snippet_b": "文本 B",
+                "conflict_reason": "冲突原因"
+                }}
+            ],
+            "trusted_evidences": [
+                {{
+                "title": "标题",
+                "url": "链接",
+                "snippet": "摘要",
+                "date": "日期或空字符串",
+                "trust_reason": "可信原因"
+                }}
+            ],
+            "summary": "整体判断说明"
+            }}
+            
+            注意：
+            - has_contradiction 只能是字符串："true"、"false" 或 "uncertain"
+            - 如果没有冲突，conflicting_pairs 必须是 []
+            - 如果没有可信证据，trusted_evidences 必须是 []
+            - 所有字段都必须存在
+        """
+    response = model_answer(prompt, local_model_name, SILICONFLOW_API_KEY, max_new_tokens=5000, temperature=0.3, top_p=0.7, top_k=50, local_model=False)
+    print(f"矛盾检测模型回复：\ntype:{type(response)}\n, {response}")
+    
+    try:
+        response_dict = json.loads(response)
+        print(f"矛盾检测模型回复json化：\n{response_dict}")
+        has_contradiction = response_dict['has_contradiction']
+        conflicting_pairs = response_dict['conflicting_pairs']
+        trusted_evidences = response_dict['trusted_evidences']
+        extracted_trusted_results = [
+            {"title": info["title"], "url": info["url"], "snippet": info["snippet"], "date": info.get("date", "")}
+            for info in trusted_evidences
+        ]
+    except json.JSONDecodeError as e:
+        print(f"JSON解析错误: {e}")
+        response_dict = {
+            "has_contradiction": "uncertain",
+            "conflicting_pairs": [],
+            "trusted_evidences": [],
+            "summary": "无法解析模型回复，返回不确定"
+        }
+        has_contradiction = "uncertain"
+        conflicting_pairs = []
+        extracted_trusted_results = []
+
+    return has_contradiction, conflicting_pairs, extracted_trusted_results
+
+
+
+
 # 构造模型回答提示词
 def contruct_answer_prompt(query, local_context,local_model_name, SILICONFLOW_API_KEY):
     '''
@@ -207,7 +306,12 @@ def contruct_answer_prompt(query, local_context,local_model_name, SILICONFLOW_AP
     need_net_search_flag  = need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY)
 
     if need_net_search_flag :
-        net_context = network_search(query,SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10)
+        _, net_context = network_search(query,SERPAPI_KEY, engine="google_light",googl_domain="google.com",num=10)
+        _, _, extracted_trusted_results = detect_conflict_and_filter_net_results(query,SERPAPI_KEY,local_model_name,SILICONFLOW_API_KEY)
+        net_context = "\n".join([
+            f"{i+1}. 标题: {info['title']}\n   URL: {info['url']}\n   摘要: {info['snippet']}\n   日期: {info['date']}\n"
+            for i, info in enumerate(extracted_trusted_results)
+        ])
         prompt = f"请根据以下网络搜索结果及知识库内容回答问题，并指明来源:\n网络搜索结果：\n{net_context}\n\n知识库内容：\n{local_context}\n\n问题: {query} "
         print(f"需要联网搜索，提示词：\n{prompt}")
         return prompt
@@ -276,7 +380,7 @@ if __name__ == '__main__':
     persist_directory = os.path.join(os.path.dirname(__file__), "chroma")
     top_relevant_k=3
     local_model_name = "google/gemma-2-2b-it"
-    query = "中国证监会主席是谁？"
+    query = "美股能赚到钱吗"
 
     
     db = load_chroma(embedding_model_name, persist_directory, collection_name)
