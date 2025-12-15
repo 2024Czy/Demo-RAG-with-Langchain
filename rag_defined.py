@@ -12,6 +12,8 @@ import docx
 from langchain_core.documents import BaseDocumentTransformer, Document
 from typing import Iterable
 from serpapi import GoogleSearch
+from ollama import chat
+from ollama import ChatResponse
 
 
 
@@ -20,7 +22,6 @@ from serpapi import GoogleSearch
 '''
 待改进的点：
 3、噪声处理机制
-7、本地模型回答混乱并且加载缓慢
 。。。。
 
 '''
@@ -201,7 +202,7 @@ def need_net_search(query, local_context,local_model_name, SILICONFLOW_API_KEY):
         输出：bool    
     '''
     prompt =build_net_search_prompt(query,local_context)
-    response = model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
+    response = model_answer(prompt,SILICONFLOW_API_KEY,local_model_name=local_model_name, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
     print(f"模型判断是否需要联网：{response}")
     if  "TRUE" in str(response).upper():
         return True
@@ -241,7 +242,6 @@ def build_net_search_prompt(query, local_context): # 这里可以用检索块与
     问题：
     {query}
     """
-
 
 
     return prompt
@@ -318,7 +318,7 @@ def detect_conflict_and_filter_net_results(query, SERPAPI_KEY, local_model_name,
     - 生成的 JSON 请使用双引号，并确保所有字符串值都用双引号括起来
     - 确保生成的 JSON 内容中没有多余的逗号或其他语法错误
     """
-    response = model_answer(prompt, local_model_name, SILICONFLOW_API_KEY, max_new_tokens=5000, temperature=0.3, top_p=0.7, top_k=50, local_model=False)
+    response = model_answer(prompt, SILICONFLOW_API_KEY,local_model_name=local_model_name, max_new_tokens=5000, temperature=0.3, top_p=0.7, top_k=50, local_model=False)
     print(f"矛盾检测模型回复：\ntype:{type(response)}\n, {response}")
     
     try:
@@ -510,20 +510,30 @@ def contruct_answer_prompt(query, local_context, local_metadata, local_model_nam
 
 
 # 模型回答，根据最终模型对问题的回答的有效性来纠正是否联网的判断是一个优化点，相当于对回答进行一次检验。
-def model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False):
+def model_answer(prompt,SILICONFLOW_API_KEY,local_model_name ="google/gemma-2-2b-it", max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False):
     '''
         输入：prompt，local_model
         输出：回答（待统一类型）
     '''
-    if local_model:
-        # 本地HuggingFace LLM加载慢
-        tokenizer = AutoTokenizer.from_pretrained(local_model_name)
-        model = AutoModelForCausalLM.from_pretrained(local_model_name)
+    if local_model: # 加载慢
+        # # 方案一：调用HuggingFace LLM
+        # tokenizer = AutoTokenizer.from_pretrained(local_model_name)
+        # model = AutoModelForCausalLM.from_pretrained(local_model_name)
 
-        # pipline封装了输入处理、模型推理、输出处理，每个样本返回一个字典，放入列表中返回
-        pipe = pipeline("text-generation", model=model, tokenizer=tokenizer,max_new_tokens=max_new_tokens, temperature=temperature) # 指定 pipeline 类型为 text-generation，模型生成的最大 token 数256
+        # # pipline封装了输入处理、模型推理、输出处理，每个样本返回一个字典，放入列表中返回
+        # pipe = pipeline("text-generation", model=model, tokenizer=tokenizer,max_new_tokens=max_new_tokens, temperature=temperature) # 指定 pipeline 类型为 text-generation，模型生成的最大 token 数256
 
-        return  pipe(prompt) 
+        # return  pipe(prompt) 
+        
+        # 方案二：调用ollama部署在本地的模型,这里用gemma3:270m做个举例，实际不要参数这么少的
+        response: ChatResponse = chat(model='gemma3:270m', messages=[
+            {
+                'role': 'user',
+                'content': prompt,
+            },
+            ])
+        return response['message']['content']
+        
         
     else:
         
@@ -583,5 +593,5 @@ if __name__ == '__main__':
     docs, local_context, local_metadata = retrieve_relevant_chunks(query=query, retriever=retriever, top_relevant_k=top_relevant_k)
 
     prompt = contruct_answer_prompt(query=query, local_context=local_context,local_metadata=local_metadata,local_model_name=local_model_name, SILICONFLOW_API_KEY=SILICONFLOW_API_KEY)
-    answer = model_answer(prompt,local_model_name,SILICONFLOW_API_KEY, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
+    answer = model_answer(prompt,SILICONFLOW_API_KEY,local_model_name=local_model_name, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=True)
     print(f'\n问题：{query}\n回答：{answer}')
