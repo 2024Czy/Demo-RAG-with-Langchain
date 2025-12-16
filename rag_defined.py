@@ -14,15 +14,16 @@ from typing import Iterable
 from serpapi import GoogleSearch
 from ollama import chat
 from ollama import ChatResponse
-
+from typing import Iterable, List
+from bs4 import BeautifulSoup
+import re
 
 
 
 
 '''
 待改进的点：
-3、噪声处理机制
-。。。。
+
 
 '''
 
@@ -50,7 +51,69 @@ def load_single_file(file_path):  # 逐个读取，后期文件多可以设置mo
     return loader.load()
 
 
-# 加载一个目录下的所有文件
+# 文本清理
+def clean_text(text: str) -> str:
+    """
+    - 去掉 HTML 标签
+    - 删除不可打印字符
+    - 合并多余空格和换行
+    """
+    if not text:
+        return ""
+
+    # 去掉HTML标签
+    text = BeautifulSoup(text, "html.parser").get_text(separator=" ")
+    # 删除不可打印字符
+    text = ''.join(c for c in text if c.isprintable())
+  
+    NEW_PARAGRAPH_SEP = "[P_SEP]" # 段落分隔符标记
+    NEW_LINE_BREAK = "[L_BRK]"    # 行内换行标记
+    # 1. 优先替换最长的分隔符：\n\n
+    text_with_psep = text.replace('\n\n', NEW_PARAGRAPH_SEP)
+    # 2. 替换剩下的 \n
+    text_with_lbrk = text_with_psep.replace('\n', NEW_LINE_BREAK)
+    # 3. 全面扁平化（现在安全的，因为所有 \s 符号只有 \t 和空格了）
+    text_cleaned = re.sub(r'\s+', ' ', text_with_lbrk).strip()
+    return text_cleaned
+
+
+# 文档级噪声处理
+def noise_process(documents: Iterable[Document]) -> List[Document]:
+    """
+    输入: List[Document]
+    输出: List[Document]
+    - 清理文本内容
+    - 删除空文本块
+    - 可扩展：去重、过滤广告/版权等
+    """
+    cleaned_docs = []
+    seen_texts = set()  # 简单去重
+
+    for doc in documents:
+        original_text = doc.page_content
+        cleaned_text = clean_text(original_text)
+
+        # 删除空文本
+        if not cleaned_text:
+            continue
+
+        # 简单去重
+        if cleaned_text in seen_texts:
+            continue
+        seen_texts.add(cleaned_text)
+
+        # 保留原始元信息
+        metadata = doc.metadata.copy() if doc.metadata else {}
+        cleaned_doc = Document(page_content=cleaned_text, metadata=metadata)
+        cleaned_docs.append(cleaned_doc)
+
+
+    return cleaned_docs
+
+
+
+
+# 加载一个目录下的所有文件（内附去重）
 def load_directory(directory):
     '''
         输入：目录路径
@@ -63,11 +126,13 @@ def load_directory(directory):
         file_path = os.path.join(directory, file)
         if os.path.isfile(file_path):
             new_docs = load_single_file(file_path)
-            docs = docs + new_docs
-            # print("查看详情：",new_docs)
+            cleaned_new_docs = noise_process(new_docs)
+            docs = docs + cleaned_new_docs
+            print("查看详情：",cleaned_new_docs)
             print(f"加载{file_path}成功")
-            print(f"新增长度：{len(new_docs)}, 当前长度：{len(docs)}")
+            print(f"新增长度：{len(new_docs)},去除噪声后长度：{len(cleaned_new_docs)}, 当前长度：{len(docs)}")
     return docs
+
 
 
 # 文本切分
@@ -76,9 +141,11 @@ def split_text(documents:Iterable[Document], chunk_size=200, chunk_overlap=30):
         输入：list[Document]，切分参数
         输出：list[Document]
     '''
-    splliter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,chunk_overlap=chunk_overlap, add_start_index=True) # 循环递归切分器（段落-句子-字符），最大字符数为500，切分重叠度为50
+    splliter = RecursiveCharacterTextSplitter(chunk_size=chunk_size,chunk_overlap=chunk_overlap, separators=["[P_SEP]", "[L_BRK]","。","?","!",";",""], add_start_index=True) # 循环递归切分器
     chunks = splliter.split_documents(documents)
-    print("第一个分块：",chunks[0])
+    print("第十个分块：",chunks[9])
+    print("第一百个分块：",chunks[99])
+    print("第三百个分块：",chunks[299])
     print(f"分块数：{len(chunks)}")
     return chunks
 
@@ -114,19 +181,6 @@ def store_chroma( embedding_model_name, collection_name, persist_directory, docu
         print('数据库已追加存储成功')
         return db
 
-# # 追加存储
-# def append_store_chroma(db, append_files_path):
-#     '''
-#         输入：追加文件路径，embedding_function，persist_directory
-#         输出：Chroma
-#     '''
-#     print("开始追加存储...")
-#     docs = load_directory(append_files_path)
-#     chunks = split_text(docs)
-#     # db = load_chroma(embedding_model_name, persist_directory, collection_name)
-#     db = db.from_documents()
-#     print('数据库已追加存储成功')
-#     return db
 
 
 # 加载Chroma
@@ -235,6 +289,7 @@ def build_net_search_prompt(query, local_context): # 这里可以用检索块与
 
     【回答 True（需要联网）】
     当且仅当满足以下条件：
+    - 问题中包含“全面”，“详细”等字眼，需要深入了解的；
     - 本地知识库中缺少问题所需的关键事实或核心信息；
     - 在不引入外部信息的前提下，无法形成一个逻辑自洽的回答；
     - 回答只能是“无法判断”“没有相关信息”。
@@ -525,8 +580,8 @@ def model_answer(prompt,SILICONFLOW_API_KEY,local_model_name ="google/gemma-2-2b
 
         # return  pipe(prompt) 
         
-        # 方案二：调用ollama部署在本地的模型,这里用gemma3:270m做个举例，实际不要参数这么少的
-        response: ChatResponse = chat(model='gemma3:270m', messages=[
+        # 方案二：调用ollama部署在本地的模型
+        response: ChatResponse = chat(model='deepseek-r1:7b', messages=[
             {
                 'role': 'user',
                 'content': prompt,
@@ -574,11 +629,11 @@ if __name__ == '__main__':
     data_directory = os.path.join(os.path.dirname(__file__), "data")
     append_files_path = os.path.join(os.path.dirname(__file__), "append_data")
     embedding_model_name = "Qwen/Qwen3-Embedding-0.6B"
-    collection_name = "test"
-    persist_directory = os.path.join(os.path.dirname(__file__), "chroma3")
+    collection_name = "test-clean"
+    persist_directory = os.path.join(os.path.dirname(__file__), "chroma3-clean")
     top_relevant_k= 10
     local_model_name = "google/gemma-2-2b-it"
-    query = "清华大学在哪里"    # 这里可以做一个长文测试和错别字测试，会有优化点
+    query = "详细评价一下中国A股"    # 这里可以做一个长文测试和错别字测试，会有优化点
 
     
     db = load_chroma(embedding_model_name, persist_directory, collection_name)
@@ -593,5 +648,5 @@ if __name__ == '__main__':
     docs, local_context, local_metadata = retrieve_relevant_chunks(query=query, retriever=retriever, top_relevant_k=top_relevant_k)
 
     prompt = contruct_answer_prompt(query=query, local_context=local_context,local_metadata=local_metadata,local_model_name=local_model_name, SILICONFLOW_API_KEY=SILICONFLOW_API_KEY)
-    answer = model_answer(prompt,SILICONFLOW_API_KEY,local_model_name=local_model_name, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=True)
+    answer = model_answer(prompt,SILICONFLOW_API_KEY,local_model_name=local_model_name, max_new_tokens=350, temperature=0.7,top_p=0.7, top_k=50, local_model=False)
     print(f'\n问题：{query}\n回答：{answer}')
